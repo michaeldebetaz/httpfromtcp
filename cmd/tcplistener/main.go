@@ -43,6 +43,8 @@ func main() {
 		for k, v := range req.Headers {
 			fmt.Printf("- %s: %s\n", k, v)
 		}
+		fmt.Println("Body:")
+		fmt.Printf("%s", string(req.Body))
 
 		slog.Info("Connection closed", "remoteAddr", conn.RemoteAddr().String())
 	}

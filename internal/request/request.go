@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"unicode"
 
@@ -15,6 +16,7 @@ type requestState int
 const (
 	initialized requestState = iota
 	parsingHeaders
+	parsingBody
 	done
 )
 
@@ -24,6 +26,7 @@ type Request struct {
 	state       requestState
 	RequestLine RequestLine
 	Headers     headers.Headers
+	Body        []byte
 }
 
 type RequestLine struct {
@@ -32,20 +35,9 @@ type RequestLine struct {
 	Method        string
 }
 
-func (r *Request) initialized() bool {
-	return r.state == initialized
-}
-
-func (r *Request) parsingHeaders() bool {
-	return r.state == parsingHeaders
-}
-
-func (r *Request) done() bool {
-	return r.state == done
-}
-
 func (r *Request) parse(data []byte) (int, error) {
-	if r.initialized() {
+	switch r.state {
+	case initialized:
 		requestLine, read, err := parseRequestLine(data)
 		if err != nil {
 			err := fmt.Errorf("failed to parse request line: %w", err)
@@ -58,12 +50,11 @@ func (r *Request) parse(data []byte) (int, error) {
 		}
 
 		return read, nil
-	}
 
-	if r.parsingHeaders() {
+	case parsingHeaders:
 		totalBytesParsed := 0
 
-		for !r.done() {
+		for r.state != parsingBody {
 			read, err := r.parseSingle(data[totalBytesParsed:])
 			if err != nil {
 				err := fmt.Errorf("failed to parse headers: %w", err)
@@ -78,6 +69,40 @@ func (r *Request) parse(data []byte) (int, error) {
 		}
 
 		return totalBytesParsed, nil
+
+	case parsingBody:
+		read := len(data)
+
+		contentLengthStr := r.Headers.Get("Content-length")
+		if contentLengthStr == "" {
+			r.state = done
+			return read, nil
+		}
+
+		contentLength, err := strconv.Atoi(contentLengthStr)
+		if err != nil {
+			err := fmt.Errorf("error converting '%s' to integer", contentLengthStr)
+			return read, err
+		}
+
+		r.Body = append(r.Body, data...)
+		bodyLength := len(r.Body)
+
+		if read == 0 && bodyLength < contentLength {
+			err := fmt.Errorf("body length (%d) is smaller than headers content-length (%d)", bodyLength, contentLength)
+			return read, err
+		}
+
+		if bodyLength > contentLength {
+			err := fmt.Errorf("body length (%d) is greater than headers content-length (%d)", bodyLength, contentLength)
+			return read, err
+		}
+
+		if bodyLength == contentLength {
+			r.state = done
+		}
+
+		return read, nil
 	}
 
 	return 0, fmt.Errorf("unknown parser state")
@@ -91,7 +116,7 @@ func (r *Request) parseSingle(data []byte) (int, error) {
 	}
 
 	if d {
-		r.state = done
+		r.state = parsingBody
 		return read, nil
 	}
 
@@ -107,7 +132,7 @@ func RequestFromReader(r io.Reader) (*Request, error) {
 		Headers: headers.NewHeaders(),
 	}
 
-	for !request.done() {
+	for request.state != done {
 		if readToIndex == len(buf) {
 			buf2 := make([]byte, len(buf)*2)
 			copy(buf2, buf[:readToIndex])
