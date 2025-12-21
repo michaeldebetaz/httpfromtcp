@@ -1,13 +1,12 @@
 package main
 
 import (
-	"errors"
 	"fmt"
-	"io"
 	"log"
 	"log/slog"
 	"net"
-	"strings"
+
+	"httpfromtcp/internal/request"
 )
 
 func main() {
@@ -29,54 +28,22 @@ func main() {
 
 		slog.Info("Accepted connection", "remoteAddr", conn.RemoteAddr().String())
 
-		for line := range getLinesChannel(conn) {
-			fmt.Println(line)
+		req, err := request.RequestFromReader(conn)
+		if err != nil {
+			slog.Error("Error reading request", "error", err, "remoteAddr", conn.RemoteAddr().String())
+			conn.Close()
+			continue
+		}
+
+		fmt.Println("Request line:")
+		fmt.Printf("- Method: %s\n", req.RequestLine.Method)
+		fmt.Printf("- Target: %s\n", req.RequestLine.RequestTarget)
+		fmt.Printf("- Version: %s\n", req.RequestLine.HttpVersion)
+		fmt.Println("Headers:")
+		for k, v := range req.Headers {
+			fmt.Printf("- %s: %s\n", k, v)
 		}
 
 		slog.Info("Connection closed", "remoteAddr", conn.RemoteAddr().String())
 	}
-}
-
-func getLinesChannel(rc io.ReadCloser) <-chan string {
-	ch := make(chan string)
-	buf := make([]byte, 4096)
-	currentLine := ""
-
-	go func() {
-		for {
-			n, err := rc.Read(buf)
-			if err != nil {
-				if errors.Is(err, io.EOF) {
-					if len(currentLine) > 0 {
-						ch <- currentLine
-					}
-
-					rc.Close()
-					close(ch)
-
-					break
-				} else {
-					log.Fatalf("Error reading file: %v", err)
-				}
-			}
-
-			parts := strings.Split(string(buf[:n]), "\r\n")
-
-			if len(parts) == 1 {
-				currentLine += parts[0]
-			}
-
-			if len(parts) > 1 {
-				lastIndex := len(parts) - 1
-
-				for _, part := range parts[:lastIndex] {
-					ch <- currentLine + part
-				}
-
-				currentLine = parts[lastIndex]
-			}
-		}
-	}()
-
-	return ch
 }
