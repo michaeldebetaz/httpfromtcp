@@ -10,13 +10,13 @@ import (
 
 type Headers map[string]string
 
-func (h Headers) Get(key string) string {
+func (h Headers) Get(key string) (string, bool) {
 	val, ok := h[strings.ToLower(key)]
 	if !ok {
-		return ""
+		return "", false
 	}
 
-	return val
+	return val, true
 }
 
 func (h Headers) Parse(data []byte) (n int, done bool, err error) {

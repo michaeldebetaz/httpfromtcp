@@ -2,8 +2,10 @@ package request
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"strconv"
 	"strings"
 	"unicode"
@@ -24,7 +26,7 @@ const bufferSize int = 8
 
 type Request struct {
 	state       requestState
-	RequestLine RequestLine
+	RequestLine *RequestLine
 	Headers     headers.Headers
 	Body        []byte
 }
@@ -36,91 +38,86 @@ type RequestLine struct {
 }
 
 func (r *Request) parse(data []byte) (int, error) {
+	bytesParsed := 0
+
+	for r.state != done {
+		n, err := r.parseSingle(data[bytesParsed:])
+		if err != nil {
+			return 0, err
+		}
+
+		bytesParsed += n
+		if n == 0 {
+			break
+		}
+	}
+
+	return bytesParsed, nil
+}
+
+func (r *Request) parseSingle(data []byte) (int, error) {
 	switch r.state {
 	case initialized:
-		requestLine, read, err := parseRequestLine(data)
+		requestLine, parsed, err := parseRequestLine(data)
 		if err != nil {
 			err := fmt.Errorf("failed to parse request line: %w", err)
-			return read, err
+			return parsed, err
 		}
 
-		if read > 0 {
-			r.RequestLine = requestLine
-			r.state = parsingHeaders
+		if parsed == 0 {
+			return 0, nil
 		}
 
-		return read, nil
+		r.RequestLine = requestLine
+		r.state = parsingHeaders
+
+		return parsed, nil
 
 	case parsingHeaders:
-		totalBytesParsed := 0
-
-		for r.state != parsingBody {
-			read, err := r.parseSingle(data[totalBytesParsed:])
-			if err != nil {
-				err := fmt.Errorf("failed to parse headers: %w", err)
-				return read, err
-			}
-
-			if read == 0 {
-				break
-			}
-
-			totalBytesParsed += read
+		parsed, done, err := r.Headers.Parse(data)
+		if err != nil {
+			return 0, err
 		}
 
-		return totalBytesParsed, nil
+		if done {
+			r.state = parsingBody
+		}
+
+		return parsed, nil
 
 	case parsingBody:
-		read := len(data)
-
-		contentLengthStr := r.Headers.Get("Content-length")
-		if contentLengthStr == "" {
+		contentLengthStr, ok := r.Headers.Get("Content-length")
+		if !ok {
 			r.state = done
-			return read, nil
+			return len(data), nil
 		}
 
 		contentLength, err := strconv.Atoi(contentLengthStr)
 		if err != nil {
-			err := fmt.Errorf("error converting '%s' to integer", contentLengthStr)
-			return read, err
+			return 0, fmt.Errorf("error converting '%s' to integer", contentLengthStr)
 		}
 
 		r.Body = append(r.Body, data...)
 		bodyLength := len(r.Body)
 
-		if read == 0 && bodyLength < contentLength {
+		if len(data) == 0 && bodyLength < contentLength {
 			err := fmt.Errorf("body length (%d) is smaller than headers content-length (%d)", bodyLength, contentLength)
-			return read, err
+			return 0, err
 		}
 
 		if bodyLength > contentLength {
 			err := fmt.Errorf("body length (%d) is greater than headers content-length (%d)", bodyLength, contentLength)
-			return read, err
+			return 0, err
 		}
 
 		if bodyLength == contentLength {
 			r.state = done
 		}
 
-		return read, nil
+		return len(data), nil
 	}
 
 	return 0, fmt.Errorf("unknown parser state")
-}
-
-func (r *Request) parseSingle(data []byte) (int, error) {
-	read, d, err := r.Headers.Parse(data)
-	if err != nil {
-		err := fmt.Errorf("failed to parse heaeder: %w", err)
-		return 0, err
-	}
-
-	if d {
-		r.state = parsingBody
-		return read, nil
-	}
-
-	return read, nil
 }
 
 func RequestFromReader(r io.Reader) (*Request, error) {
@@ -130,56 +127,49 @@ func RequestFromReader(r io.Reader) (*Request, error) {
 	request := &Request{
 		state:   initialized,
 		Headers: headers.NewHeaders(),
+		Body:    make([]byte, 0),
 	}
 
 	for request.state != done {
-		if readToIndex == len(buf) {
-			buf2 := make([]byte, len(buf)*2)
-			copy(buf2, buf[:readToIndex])
-			buf = buf2
+		slog.Info("Request", "state", request.state)
+
+		if readToIndex >= len(buf) {
+			newBuf := make([]byte, len(buf)*2)
+			copy(newBuf, buf[:readToIndex])
+			buf = newBuf
 		}
 
-		n, err := r.Read(buf[readToIndex:])
+		bytesRead, err := r.Read(buf[readToIndex:])
 		if err != nil {
-			if err == io.EOF {
-				_, err := request.parse(buf[:readToIndex])
-				if err != nil {
-					err := fmt.Errorf("failed to parse request: %w", err)
-					return nil, err
+			if errors.Is(err, io.EOF) {
+				if request.state != done {
+					return nil, fmt.Errorf(
+						"incomplete request, in state: %d, read n bytes on EOF: %d", request.state, bytesRead,
+					)
 				}
-				request.state = done
 				break
-			} else {
-				err := fmt.Errorf("failed to read from reader: %w", err)
-				return nil, err
 			}
+			return nil, err
 		}
+		readToIndex += bytesRead
 
-		readToIndex += n
-
-		read, err := request.parse(buf[:readToIndex])
+		bytesParsed, err := request.parse(buf[:readToIndex])
 		if err != nil {
 			err := fmt.Errorf("failed to parse request: %w", err)
 			return nil, err
 		}
-		if read == 0 {
-			continue
-		}
 
-		if read > 0 {
-			copy(buf, buf[read:readToIndex])
-			readToIndex -= read
-		}
-
+		copy(buf, buf[bytesParsed:])
+		readToIndex -= bytesParsed
 	}
 
 	return request, nil
 }
 
-func parseRequestLine(data []byte) (RequestLine, int, error) {
+func parseRequestLine(data []byte) (*RequestLine, int, error) {
 	idx := bytes.Index(data, []byte("\r\n"))
 	if idx < 0 {
-		return RequestLine{}, 0, nil
+		return &RequestLine{}, 0, nil
 	}
 
 	read := idx + 2
@@ -189,42 +179,42 @@ func parseRequestLine(data []byte) (RequestLine, int, error) {
 	parts := strings.Split(line, " ")
 	if len(parts) != 3 {
 		err := fmt.Errorf("request line must contain exactly 3 parts")
-		return RequestLine{}, read, err
+		return &RequestLine{}, read, err
 	}
 
 	method := parts[0]
 	if len(method) == 0 {
 		err := fmt.Errorf("method must not be empty")
-		return RequestLine{}, read, err
+		return &RequestLine{}, read, err
 	}
 
 	for _, c := range method {
 		if c < 'A' || 'Z' < c {
 			err := fmt.Errorf("method must contain only capital letters")
-			return RequestLine{}, read, err
+			return &RequestLine{}, read, err
 		}
 	}
 
 	httpVersion := strings.TrimPrefix(parts[2], "HTTP/")
 	if httpVersion != "1.1" {
 		err := fmt.Errorf("unsupported HTTP version: %s", httpVersion)
-		return RequestLine{}, read, err
+		return &RequestLine{}, read, err
 	}
 
 	requestTarget := parts[1]
 	if len(requestTarget) == 0 {
 		err := fmt.Errorf("request target must not be empty")
-		return RequestLine{}, read, err
+		return &RequestLine{}, read, err
 	}
 
 	for _, c := range requestTarget {
 		if unicode.IsSpace(c) {
 			err := fmt.Errorf("request target must not contain whitespace")
-			return RequestLine{}, read, err
+			return &RequestLine{}, read, err
 		}
 	}
 
-	return RequestLine{
+	return &RequestLine{
 		Method:        method,
 		RequestTarget: requestTarget,
 		HttpVersion:   httpVersion,
